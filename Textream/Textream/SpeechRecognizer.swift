@@ -107,6 +107,43 @@ class SpeechRecognizer {
     /// We require 2-of-3 recent results to agree before committing a forward jump.
     private var recentMatchPositions: [Int] = []
 
+    // MARK: - 意译识别（本地语义兜底层）
+    //
+    // 旧逐字/逐词匹配拿不准时，用本地语义判断「用户说的话和稿子前方哪一段意思最近」。
+    // 旧逻辑高置信命中时直接返回，语义不否决（向后兼容、降回归风险）。
+    // 调参最终值由 TASK-003 在 knowledge/generated/spike-semantic 用更大样本敲定后写入
+    // knowledge/decisions.md；此处为 PROJECT-SPEC/decisions 的候选默认值。
+    private let semanticMatcher = SemanticMatcher()
+    /// 语义层是否就绪（主线程读写）。模型未就绪期间纯走旧逻辑，不阻塞跟读。
+    private var semanticReady = false
+    /// 串行队列：NLContextualEmbedding 未声明线程安全，编码在此串行、不占主线程。
+    private let semanticQueue = DispatchQueue(label: "com.textream.semantic", qos: .userInitiated)
+    /// 防止异步语义任务在主线程间堆叠。
+    private var semanticInFlight = false
+    /// 主阈值 T：≥T 视为语义强匹配（冻结操作阈值，见 decisions.md 第 1 条）。
+    private let semanticThreshold = 0.70
+    /// 不确定带宽 δ：[T-δ, T) 不推进（极端意译留给 TASK-005 云端补漏）。
+    private let semanticUncertainBand = 0.10
+    /// 仅向前候选段数 K：只与指针前方至多 K 段比对，天然不向后匹配。
+    private let semanticForwardSegments = 3
+    /// 语义窗口上限：SFSpeechRecognizer 单次会话的 formattedString 是「本会话累计转写」，
+    /// 中文连续听写常不吐句末标点，靠标点切「最近一句」会退化成整段累计文本，
+    /// 语义向量被稀释、后半段相似度跌破 T 而停止推进。故窗口强制只取结尾一小段。
+    /// 此长度为候选默认值，最终由 TASK-003 调参定值。
+    private let semanticWindowMaxChars = 48
+    /// 单次语义确认后最多前进的段数（粒度细化）：语义命中前方第 i 段时，原逻辑一次推进
+    /// 过 0...i 全部段（最多 K 段一跳，体感"窜一大段"）；此上限把单次推进收敛到至多
+    /// N 段，靠后续连续匹配逐段追上，更接近逐句推进。仅缩小"一次走多远"，不改匹配判定
+    /// 与 2/3 防误翻门禁——走得更少更保守、更偏「宁可漏翻」，防误翻只增不减。
+    /// 候选默认 1，最终由 TASK-003 调参定值（与 T/δ/K/M/窗口/静默 同批）。
+    private let semanticMaxAdvanceSegments = 1
+    /// 配速锚 / 领先夹紧上限：指针相对「matchStartOffset + 本会话累计转写经
+    /// splitTextIntoWords 投影后的脚本单位量」最多领先的字符数。超出即不推进，
+    /// 防止旧逐字/逐词在意译或只说几个词时窜到稿子前方 3-4 句、埋掉未读行。
+    /// 用户裁决=严格锁定：取紧的小余量、强偏「宁可漏翻不可误翻」。
+    /// 候选默认 8，最终由 TASK-003 调参定值（与 T/δ/K/M/窗口/推进段数 同批）。
+    private let semanticMaxLeadChars = 8
+
     /// Update the source text while preserving the current recognized char count.
     /// Used by Director Mode to live-edit unread text without resetting read progress.
     func updateText(_ text: String, preservingCharCount: Int) {
@@ -145,6 +182,7 @@ class SpeechRecognizer {
         recentMatchPositions = []
         error = nil
         sessionGeneration += 1
+        prepareSemanticIfNeeded()
 
         // Check microphone permission first
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
@@ -216,7 +254,19 @@ class SpeechRecognizer {
         matchStartOffset = recognizedCharCount
         recentMatchPositions = []
         shouldDismiss = false
+        prepareSemanticIfNeeded()
         beginRecognition()
+    }
+
+    /// 在非主线程一次性加载本地语义模型资产。离线/无资产时保持降级（semanticReady=false），
+    /// 不抛错、不阻塞「开始跟读」。已就绪则跳过。
+    private func prepareSemanticIfNeeded() {
+        if semanticReady { return }
+        semanticQueue.async { [weak self] in
+            guard let self else { return }
+            let ok = self.semanticMatcher.prepare()
+            DispatchQueue.main.async { self.semanticReady = ok }
+        }
     }
 
     private func cleanupRecognitionTask() {
@@ -595,37 +645,214 @@ class SpeechRecognizer {
         }
 
         let newCount = matchStartOffset + best
-        guard newCount > recognizedCharCount else { return }
+        var legacyCommitted = false
 
-        let candidate = min(newCount, sourceText.count)
+        if newCount > recognizedCharCount {
+            // 配速锚：candidate 不得超过「matchStartOffset + 已说出脚本单位量 + 余量」，
+            // 防止旧逐字/逐词窜到稿子前方埋掉未读行。smallStep 由夹紧后 candidate 计算，
+            // ≤15 小步因此无法链式越过此天花板（结构性闭合 smallStep 漏洞）。
+            let paceCeiling = matchStartOffset + spokenScriptUnits(spoken) + semanticMaxLeadChars
+            let candidate = min(newCount, sourceText.count, paceCeiling)
 
-        // Confidence gating: require 2-of-3 recent results to agree on
-        // forward movement to avoid single-result false-positive jumps.
-        recentMatchPositions.append(candidate)
-        if recentMatchPositions.count > 3 {
-            recentMatchPositions.removeFirst()
+            // Confidence gating: require 2-of-3 recent results to agree on
+            // forward movement to avoid single-result false-positive jumps.
+            recentMatchPositions.append(candidate)
+            if recentMatchPositions.count > 3 {
+                recentMatchPositions.removeFirst()
+            }
+
+            // Check if at least 2 of the recent positions agree (within tolerance)
+            let agreementThreshold = 10 // characters
+            var confirmed = false
+            if recentMatchPositions.count >= 2 {
+                var agreeCount = 0
+                for pos in recentMatchPositions {
+                    if abs(pos - candidate) <= agreementThreshold {
+                        agreeCount += 1
+                    }
+                }
+                confirmed = agreeCount >= 2
+            }
+
+            // Small forward movements (< 1 word length) are always allowed
+            // to keep the highlight responsive for normal reading
+            let smallStep = candidate - recognizedCharCount <= 15
+
+            if confirmed || smallStep {
+                recognizedCharCount = candidate
+                legacyCommitted = true
+            }
         }
 
-        // Check if at least 2 of the recent positions agree (within tolerance)
-        let agreementThreshold = 10 // characters
-        var confirmed = false
-        if recentMatchPositions.count >= 2 {
-            var agreeCount = 0
-            for pos in recentMatchPositions {
-                if abs(pos - candidate) <= agreementThreshold {
+        // 语义兜底：仅当旧逐字/逐词本次未确认前进（拿不准或无进展）时启用。
+        // 旧逻辑高置信命中时上面已 commit，这里直接 return，语义不否决。
+        if legacyCommitted { return }
+        attemptSemanticMatch(spoken: spoken)
+    }
+
+    // MARK: - 语义兜底匹配
+
+    /// 旧逻辑拿不准时调用：把「最近口语窗口」与「指针前方至多 K 段」做本地语义比对，
+    /// 异步编码不占主线程；结果回主线程并入同一 2/3 确认门禁，过期则丢弃（防误翻/防抖动）。
+    private func attemptSemanticMatch(spoken: String) {
+        guard semanticReady, !semanticInFlight else { return }
+        guard recognizedCharCount < sourceText.count else { return }
+
+        let window = recentSpokenWindow(spoken)
+        guard window.count >= 2 else { return }
+
+        let pointerSnapshot = recognizedCharCount
+        let generationSnapshot = sessionGeneration
+        let segments = forwardSemanticSegments(fromOffset: pointerSnapshot,
+                                               maxCount: semanticForwardSegments)
+        guard !segments.isEmpty else { return }
+
+        semanticInFlight = true
+        let candidateTexts = segments.map { $0.text }
+        semanticQueue.async { [weak self] in
+            guard let self else { return }
+            let result = self.semanticMatcher.bestForwardMatch(
+                spokenWindow: window,
+                forwardCandidates: candidateTexts
+            )
+            DispatchQueue.main.async {
+                self.semanticInFlight = false
+
+                // 过期丢弃：会话已切换，或指针已被后续旧逻辑推进越过快照点 → 结果失效，不回退。
+                guard self.sessionGeneration == generationSnapshot,
+                      self.recognizedCharCount == pointerSnapshot else { return }
+
+                guard result.available,
+                      result.bestIndex >= 0,
+                      result.bestIndex < segments.count else { return }
+
+                // 不确定带 [T-δ, T)：本地不推进（极端意译留给 TASK-005 云端补漏）。
+                // < T-δ：判为不匹配，不推进。
+                guard result.bestScore >= self.semanticThreshold else { return }
+
+                // 命中第 i 段 = 用户已讲到该段末尾。粒度细化：单次最多推进
+                // semanticMaxAdvanceSegments 段（cappedIndex），跨多段时靠后续连续
+                // 匹配逐段追上；走得更少更保守，不改匹配判定与下方 2/3 防误翻门禁。
+                let cappedIndex = min(result.bestIndex, self.semanticMaxAdvanceSegments - 1)
+                var advance = pointerSnapshot
+                for k in 0...cappedIndex { advance += segments[k].rawLen }
+                // 配速锚：语义路径同样夹紧（≥T、2/3、仅向前、过期丢弃均不变）。
+                let paceCeiling = self.matchStartOffset + self.spokenScriptUnits(spoken) + self.semanticMaxLeadChars
+                let candidate = min(advance, self.sourceText.count, paceCeiling)
+                guard candidate > self.recognizedCharCount else { return }
+
+                // 并入同一 2/3 确认门禁；语义跳段不享受 smallStep 直通，必须确认（防误翻）。
+                self.recentMatchPositions.append(candidate)
+                if self.recentMatchPositions.count > 3 {
+                    self.recentMatchPositions.removeFirst()
+                }
+                let agreementThreshold = 10
+                var agreeCount = 0
+                for pos in self.recentMatchPositions where abs(pos - candidate) <= agreementThreshold {
                     agreeCount += 1
                 }
+                if self.recentMatchPositions.count >= 2 && agreeCount >= 2 {
+                    self.recognizedCharCount = candidate
+                }
             }
-            confirmed = agreeCount >= 2
+        }
+    }
+
+    /// 取「用户最近说的话」窗口，代表当前进度。`spoken` 是 SFSpeechRecognizer 单次会话的
+    /// 累计转写：优先未结句尾段，否则上一句，否则全句尾部；但**无论是否有句末标点**，
+    /// 最终都强制截断到结尾 `semanticWindowMaxChars` 字符，避免中文无标点连续听写时
+    /// 窗口随累计转写无限膨胀、语义向量被稀释导致后半段停推（真机验收 r03→r04 修正）。
+    private func recentSpokenWindow(_ spoken: String) -> String {
+        let trimmed = spoken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        let sentenceEnders: Set<Character> = ["。", "！", "？", "；", ".", "!", "?", ";", "\n"]
+        var lastSentence = ""
+        var current = ""
+        for ch in trimmed {
+            if sentenceEnders.contains(ch) {
+                let s = current.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !s.isEmpty { lastSentence = s }
+                current = ""
+            } else {
+                current.append(ch)
+            }
+        }
+        let tail = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        let chosen: String
+        if tail.count >= 2 {
+            chosen = tail
+        } else if !lastSentence.isEmpty {
+            chosen = lastSentence
+        } else {
+            chosen = trimmed
+        }
+        // 关键有界化：窗口必须是「最近一小段」，不能等于整段累计转写。
+        if chosen.count > semanticWindowMaxChars {
+            return String(chosen.suffix(semanticWindowMaxChars))
+        }
+        return chosen
+    }
+
+    /// 把本会话累计转写投影到与 sourceText 相同单位系（splitTextIntoWords 后空格拼接），
+    /// 得到「用户已说出的脚本单位量」，与 recognizedCharCount/matchStartOffset 直接可比。
+    private func spokenScriptUnits(_ spoken: String) -> Int {
+        splitTextIntoWords(spoken).joined(separator: " ").count
+    }
+
+    /// 从指针偏移起、向前至多 maxCount 段。返回每段：可读文本（去掉 CJK 逐字间空格，
+    /// 用于语义编码）+ rawLen（该段在 sourceText 中消耗的 Character 数，含分隔符，用于偏移映射）。
+    /// 只向前取，天然不向后匹配。
+    private func forwardSemanticSegments(fromOffset offset: Int,
+                                         maxCount: Int) -> [(text: String, rawLen: Int)] {
+        guard offset < sourceText.count else { return [] }
+        let chars = Array(sourceText.dropFirst(offset))
+        let enders: Set<Character> = ["。", "！", "？", "；", ".", "!", "?", ";"]
+        let maxSegmentChars = 60 // 无标点时的兜底切段长度（可读字符计）
+
+        var segments: [(text: String, rawLen: Int)] = []
+        var display = ""
+        var rawLen = 0
+        var readableCount = 0
+
+        func isCJKChar(_ c: Character) -> Bool {
+            c.unicodeScalars.first.map { $0.isCJK } ?? false
+        }
+        func flush() {
+            let t = display.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !t.isEmpty && rawLen > 0 {
+                segments.append((text: t, rawLen: rawLen))
+            }
+            display = ""
+            rawLen = 0
+            readableCount = 0
         }
 
-        // Small forward movements (< 1 word length) are always allowed
-        // to keep the highlight responsive for normal reading
-        let smallStep = candidate - recognizedCharCount <= 15
-
-        if confirmed || smallStep {
-            recognizedCharCount = candidate
+        var idx = 0
+        while idx < chars.count && segments.count < maxCount {
+            let c = chars[idx]
+            rawLen += 1
+            if c == " " {
+                // splitTextIntoWords 在 CJK 逐字间插了空格：相邻两侧都是 CJK 时丢弃该空格，
+                // 还原自然文本；否则（拉丁词边界）保留一个空格。
+                let prevCJK = display.last.map { isCJKChar($0) } ?? false
+                var nextCJK = false
+                if idx + 1 < chars.count { nextCJK = isCJKChar(chars[idx + 1]) }
+                if !(prevCJK && nextCJK) && !display.isEmpty && display.last != " " {
+                    display.append(" ")
+                }
+            } else {
+                display.append(c)
+                readableCount += 1
+                if enders.contains(c) {
+                    flush()
+                } else if readableCount >= maxSegmentChars {
+                    flush()
+                }
+            }
+            idx += 1
         }
+        if segments.count < maxCount { flush() }
+        return segments
     }
 
     private func charLevelMatch(spoken: String) -> Int {
